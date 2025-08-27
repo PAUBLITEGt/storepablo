@@ -1,0 +1,99 @@
+{
+  "1629576912": {
+    "plan_normal": {
+      "nombre": "Diamante 4",
+      "max": 4,
+      "usados": 0
+    },
+    "plan_tarjetas": {
+      "nombre": "Sin plan",
+      "max": 0,
+      "usados": 0
+    },
+    "invalid_key_attempts": 0
+  },
+  "7590578210": {
+    "plan_normal": {
+      "nombre": "SuperPro",
+      "max": 1000,
+      "usados": 12
+    },
+    "plan_tarjetas": {
+      "nombre": "Plan Tarjetas",
+      "max": 1,
+      "usados": 1
+    },
+    "invalid_key_attempts": 0
+  },
+  "1532022891": {
+    "plan": "SuperPro",
+    "max": 1000,
+    "usados": 2,
+    "invalid_key_attempts": 1,
+    "plan_normal": {
+      "nombre": "SuperPro",
+      "max": 1000,
+      "usados": 0
+    },
+    "plan_tarjetas": {
+      "nombre": "Plan Tarjetas",
+      "max": 1,
+      "usados": 1
+    }
+  },
+  "6754567027": {
+    "plan_normal": {
+      "nombre": "Diamante 4",
+      "max": 4,
+      "usados": 4
+    },
+    "plan_tarjetas": {
+      "nombre": "Sin plan",
+      "max": 0,
+      "usados": 0
+    },
+    "invalid_key_attempts": 0
+  },
+  "1087968824": {
+    "plan": "Diamante 4",
+    "max": 4,
+    "usados": 3,
+    "plan_normal": {
+      "nombre": "Sin plan",
+      "max": 0,
+      "usados": 0
+    },
+    "plan_tarjetas": {
+      "nombre": "Sin plan",
+      "max": 0,
+      "usados": 0
+    },
+    "invalid_key_attempts": 0
+  },
+  "5375756281": {
+    "plan": "Bronce 1",
+    "max": 1,
+    "usados": 1
+  },
+  "6840141128": {
+    "plan": "Bronce 1",
+    "max": 1,
+    "usados": 0,
+    "plan_normal": {
+      "nombre": "Sin plan",
+      "max": 0,
+      "usados": 0
+    },
+    "plan_tarjetas": {
+      "nombre": "Sin plan",
+      "max": 0,
+      "usados": 0
+    },
+    "invalid_key_attempts": 0
+  },
+  "8109961796": {
+    "plan": "Sin plan",
+    "max": 0,
+    "usados": 0
+  }
+}

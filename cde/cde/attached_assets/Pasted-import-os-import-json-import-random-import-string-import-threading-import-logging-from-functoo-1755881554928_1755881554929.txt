@@ -1,0 +1,1092 @@
+import os
+import json
+import random
+import string
+import threading
+import logging
+from functools import wraps
+from typing import Dict, Any, List, Optional
+from flask import Flask
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, error
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler,
+    MessageHandler, filters, ContextTypes, ConversationHandler
+)
+
+# --- Configuración y Constantes ---
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+
+TOKEN: Optional[str] = os.environ.get("TELEGRAM_TOKEN")
+ADMIN: int = int(os.environ.get("ADMIN_ID", 7590578210))
+
+if not TOKEN:
+    logging.error("❌ La variable de entorno 'TELEGRAM_TOKEN' no está configurada.")
+    exit()
+
+BASE_DIR: str = os.path.dirname(os.path.abspath(__file__))
+DB_USERS: str = os.path.join(BASE_DIR, "users.json")
+DB_STOCK: str = os.path.join(BASE_DIR, "stock.json")
+DB_KEYS: str = os.path.join(BASE_DIR, "claves.json")
+DB_BANS: str = os.path.join(BASE_DIR, "ban_users.json")
+DB_ADMINS: str = os.path.join(BASE_DIR, "admins.json")
+DB_CARDS: str = os.path.join(BASE_DIR, "cards.json")
+DB_CARD_KEYS: str = os.path.join(BASE_DIR, "card_keys.json")
+
+# GIFs para el mensaje de inicio
+START_MEDIA = [
+    "https://64.media.tumblr.com/bff8a385b75b4f747ad5de78a917faae/99c3bba1a6801134-82/s540x810/7d5a2b6b57fb0ea5c61e41a935990618ec78669d.gif",
+    "https://i.pinimg.com/originals/dc/d6/2f/dcd62f5fe32b1cabae1f89626c30fef6.gif",
+    "https://i.pinimg.com/originals/cb/26/25/cb262560dbf553b91deeec5bd35d216b.gif",
+    "https://giffiles.alphacoders.com/222/222779.gif",
+    "https://giffiles.alphacoders.com/222/222779.gif",
+    "https://i.pinimg.com/originals/dc/d6/2f/dcd62f5fe32b1cabae1f89626c30fef6.gif",
+    "https://i.pinimg.com/originals/dc/d6/2f/dcd62f5fe32b1cabae1f89626c30fef6.gif",
+]
+
+# Estados para ConversationHandler
+AWAITING_USER_ID_TO_REVOKE, AWAITING_STOCK_DATA, AWAITING_CARDS_DATA, AWAITING_ADMIN_ID, AWAITING_REMOVE_ADMIN_ID, BROADCAST_CONTENT = range(6)
+
+
+# --- Servidor Keep-Alive para Replit ---
+_keep = Flask(__name__)
+
+@_keep.get("/")
+def _health():
+    """Responde 'OK' para mantener el servidor activo."""
+    return "OK", 200
+
+def _run_keep_alive():
+    """Ejecuta el servidor Flask en un hilo separado."""
+    port = int(os.environ.get("PORT", 8000))
+    _keep.run(host="0.0.0.0", port=port)
+
+threading.Thread(target=_run_keep_alive, daemon=True).start()
+# --- Fin Keep-Alive ---
+
+
+# --- Funciones de Utilidad para Base de Datos ---
+def load_data(path: str, default: Optional[Any] = None) -> Any:
+    """
+    Carga datos de un archivo JSON.
+    Retorna el valor por defecto si el archivo no existe o hay un error.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        logging.warning(f"Archivo no encontrado o con formato incorrecto: {path}")
+        return default or {} if isinstance(default, dict) else default or []
+
+def save_data(path: str, data: Any):
+    """Guarda datos en un archivo JSON de forma segura."""
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    logging.info(f"Datos guardados en {path}")
+
+
+# --- Decoradores para Verificación de Usuarios ---
+def is_banned(user_id: int) -> bool:
+    """Verifica si un usuario está baneado."""
+    banned_users = load_data(DB_BANS, default=[])
+    return user_id in banned_users
+
+def is_admin(user_id: int) -> bool:
+    """Verifica si un usuario tiene privilegios de administrador."""
+    admins = load_data(DB_ADMINS, default=[])
+    return user_id == ADMIN or user_id in admins
+
+def check_ban(func):
+    """Decorador para restringir el acceso a usuarios baneados."""
+    @wraps(func)
+    async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if update.effective_user:
+            user_id = update.effective_user.id
+        elif update.callback_query:
+            user_id = update.callback_query.from_user.id
+        else:
+            return
+
+        if user_id != ADMIN and is_banned(user_id):
+            if update.effective_message:
+                await update.effective_message.reply_text(
+                    text="🚫 <b>Estás baneado y no puedes usar este bot.</b>",
+                    parse_mode="HTML"
+                )
+            else:
+                await update.callback_query.answer("🚫 Estás baneado y no puedes usar este bot.", show_alert=True)
+            return
+        return await func(update, ctx)
+    return wrapper
+
+def check_admin(func):
+    """Decorador para restringir el acceso a usuarios admin y super admin."""
+    @wraps(func)
+    async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if update.effective_user:
+            user_id = update.effective_user.id
+        elif update.callback_query:
+            user_id = update.callback_query.from_user.id
+        else:
+            return
+
+        if not is_admin(user_id):
+            if update.effective_message:
+                await update.effective_message.reply_text("❌ No autorizado.")
+            else:
+                await update.callback_query.answer("❌ No autorizado.", show_alert=True)
+            return
+        return await func(update, ctx)
+    return wrapper
+
+def check_super_admin(func):
+    """Decorador para restringir el acceso solo al creador del bot (ADMIN)."""
+    @wraps(func)
+    async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if update.effective_user:
+            user_id = update.effective_user.id
+        elif update.callback_query:
+            user_id = update.callback_query.from_user.id
+        else:
+            return
+
+        if user_id != ADMIN:
+            if update.effective_message:
+                await update.effective_message.reply_text("❌ No autorizado.")
+            else:
+                await update.callback_query.answer("❌ No autorizado.", show_alert=True)
+            return
+        return await func(update, ctx)
+    return wrapper
+
+
+# --- Teclados de Botones ---
+def kb_start(uid: int) -> InlineKeyboardMarkup:
+    """Genera el teclado de inicio, incluyendo el panel de admin si el usuario es el admin."""
+    kb = [
+        [
+            InlineKeyboardButton("👤 Perfil", callback_data="profile"),
+            InlineKeyboardButton("📦 Stock", callback_data="stock"),
+            InlineKeyboardButton("📖 Comandos", callback_data="cmds"),
+        ]
+    ]
+    if is_admin(uid):
+        kb.append([InlineKeyboardButton("⚙️ Panel Admin", callback_data="panel")])
+    return InlineKeyboardMarkup(kb)
+
+KB_ADMIN = InlineKeyboardMarkup([
+    [InlineKeyboardButton("🔐 Crear claves", callback_data="gen_cmd")],
+    [InlineKeyboardButton("💎 SuperPro Key", callback_data="super_pro_key")],
+    [InlineKeyboardButton("❌ Quitar plan premium", callback_data="revoke_premium_start")],
+    [InlineKeyboardButton("👥 Ver usuarios", callback_data="users_cmd")],
+    [InlineKeyboardButton("🚫 Banear usuario", callback_data="ban_cmd")],
+    [InlineKeyboardButton("✅ Desbanear usuario", callback_data="unban_cmd")],
+    [InlineKeyboardButton("➕ Subir Cuentas", callback_data="addstock_start")],
+    [InlineKeyboardButton("➕ Subir Tarjetas", callback_data="addcards_start")],
+    [InlineKeyboardButton("💳 Keys Tarjetas", callback_data="gen_cards_key")],
+    [InlineKeyboardButton("📢 Enviar Anuncio", callback_data="send_msg_cmd")],
+    [InlineKeyboardButton("👑 Promover Admin", callback_data="add_admin_start")],
+    [InlineKeyboardButton("💀 Degradar Admin", callback_data="rem_admin_start")]
+])
+
+KB_RETURN_TO_START = InlineKeyboardMarkup([
+    [InlineKeyboardButton("⏪ Regresar", callback_data="start_menu")]
+])
+
+
+# --- Comandos de Inicio y Ayuda ---
+@check_ban
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Maneja el comando /start y notifica al admin sobre el nuevo usuario."""
+    uid = update.effective_user.id
+    user_info = update.effective_user
+
+    users = load_data(DB_USERS, {})
+    is_new_user = False
+    if str(uid) not in users:
+        users[str(uid)] = {
+            "plan_normal": {"nombre": "Sin plan", "max": 0, "usados": 0},
+            "plan_tarjetas": {"nombre": "Sin plan", "max": 0, "usados": 0},
+            "invalid_key_attempts": 0
+        }
+        save_data(DB_USERS, users)
+        is_new_user = True
+
+    if is_new_user and uid != ADMIN:
+        try:
+            admin_message = (
+                f"🎉 <b>Nuevo usuario ha iniciado el bot:</b>\n"
+                f"🆔 ID: <code>{user_info.id}</code>\n"
+                f"👤 Nombre: <code>{user_info.first_name}</code>\n"
+                f"🔗 Username: @{user_info.username or 'N/A'}"
+            )
+            await ctx.bot.send_message(chat_id=ADMIN, text=admin_message, parse_mode="HTML")
+        except Exception as e:
+            logging.error(f"Error al enviar mensaje al admin: {e}")
+
+    gif_url = random.choice(START_MEDIA)
+    caption_text = (
+        f"<u><b>🎉 Bienvenido a PAUBLITE_GT</b></u>\n\n"
+        f"<b>🆔 Tu ID:</b> <code>{user_info.id}</code>\n"
+        f"<b>👤 Tu Nombre:</b> <code>{user_info.first_name}</code>\n"
+        f"<b>🔗 Tu Username:</b> @{user_info.username or 'N/A'}\n\n"
+        f"<b>💳 Compra claves premium aquí 👉 @PAUBLITE_GT</b>\n"
+        f"<b>🔗 Canal Oficial:</b> https://t.me/+kpO7XeoQsDQ0MWM0\n\n"
+        f"<b>📌 Comandos:</b>\n"
+        f"  - <code>/key CLAVE</code>\n"
+        f"  - <code>/get sitio cant</code>\n\n"
+        f"<b>📌 Administración:</b> Panel abajo"
+    )
+
+    try:
+        await ctx.bot.send_animation(
+            chat_id=update.effective_chat.id,
+            animation=gif_url,
+            caption=caption_text,
+            parse_mode="HTML",
+            reply_markup=kb_start(uid)
+        )
+    except error.BadRequest as e:
+        logging.error(f"Error al enviar animación: {e}. Intentando enviar como foto...")
+        await ctx.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=caption_text,
+            parse_mode="HTML",
+            reply_markup=kb_start(uid)
+        )
+
+# --- Comandos de Usuario ---
+@check_ban
+async def key_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Maneja el comando /key para activar una clave."""
+    if not ctx.args:
+        await update.effective_chat.send_message(
+            text="🤖 <b>Uso:</b>\n<code>/key CLAVE</code>\n\n💎 Compra claves premium\n👉 @PAUBLITE_GT\n",
+            parse_mode="HTML"
+        )
+        return
+
+    clave = ctx.args[0].strip()
+    claves = load_data(DB_KEYS, {})
+    card_keys = load_data(DB_CARD_KEYS, {})
+    uid = str(update.effective_user.id)
+    users = load_data(DB_USERS, {})
+    banned_users = load_data(DB_BANS, default=[])
+
+    if uid not in users:
+        users[uid] = {
+            "plan_normal": {"nombre": "Sin plan", "max": 0, "usados": 0},
+            "plan_tarjetas": {"nombre": "Sin plan", "max": 0, "usados": 0},
+            "invalid_key_attempts": 0
+        }
+        save_data(DB_USERS, users)
+
+    user_data = users.get(uid)
+
+    is_card_key = clave in card_keys
+    is_normal_key = clave in claves
+
+    if not is_card_key and not is_normal_key:
+        user_data["invalid_key_attempts"] = user_data.get("invalid_key_attempts", 0) + 1
+        save_data(DB_USERS, users)
+
+        if user_data["invalid_key_attempts"] >= 3:
+            if int(uid) not in banned_users:
+                banned_users.append(int(uid))
+                save_data(DB_BANS, banned_users)
+                await update.effective_chat.send_message(
+                    text="🚫 <b>¡Has sido baneado!</b> Demasiados intentos fallidos con claves inválidas. No puedes usar más este bot."
+                )
+            return
+
+        await update.effective_chat.send_message(
+            text=(
+                f"❌ <b>Clave inválida. No insistas o serás baneado.</b>\n"
+                f"Intentos restantes: {3 - user_data['invalid_key_attempts']}\n\n"
+                "<b>💳 Compra claves premium</b> con un mensaje a:\n"
+                "🔗 @PAUBLITE_GT\n"
+            ),
+            parse_mode="HTML"
+        )
+        return
+
+    # Si la clave es válida, resetear los intentos
+    user_data["invalid_key_attempts"] = 0
+    save_data(DB_USERS, users)
+
+    # Lógica para canjear clave de tarjetas
+    if is_card_key:
+        if user_data["plan_tarjetas"]["nombre"] != "Sin plan" and user_data["plan_tarjetas"]["max"] > user_data["plan_tarjetas"]["usados"]:
+            await update.effective_chat.send_message(
+                text="❌ <b>Ya tienes un plan de tarjetas activo.</b>\nNo puedes activar otra clave hasta que termines tus usos actuales.",
+                parse_mode="HTML"
+            )
+            return
+        plan, maxi = card_keys.pop(clave)
+        save_data(DB_CARD_KEYS, card_keys)
+        user_data["plan_tarjetas"]["nombre"] = plan
+        user_data["plan_tarjetas"]["max"] = maxi
+        user_data["plan_tarjetas"]["usados"] = 0
+        save_data(DB_USERS, users)
+        await update.effective_chat.send_message(
+            text=(
+                f"✨ <b>¡Felicidades!</b> 🎉\n"
+                f"Has activado un nuevo plan para acceder a tarjetas. Se ha activado el plan <b>{plan}</b> con <b>{maxi}</b> usos."
+            ),
+            parse_mode="HTML"
+        )
+        return
+
+    # Lógica para canjear clave normal
+    if is_normal_key:
+        if user_data["plan_normal"]["nombre"] != "Sin plan" and user_data["plan_normal"]["max"] > user_data["plan_normal"]["usados"]:
+            await update.effective_chat.send_message(
+                text="❌ <b>Ya tienes un plan de cuentas activo.</b>\nNo puedes activar otra clave hasta que termines tus usos actuales.",
+                parse_mode="HTML"
+            )
+            return
+        plan, maxi = claves.pop(clave)
+        save_data(DB_KEYS, claves)
+        user_data["plan_normal"]["nombre"] = plan
+        user_data["plan_normal"]["max"] = maxi
+        user_data["plan_normal"]["usados"] = 0
+        save_data(DB_USERS, users)
+        await update.effective_chat.send_message(
+            text=(
+                f"✨ <b>¡Felicidades!</b> 🎉\n"
+                f"Has activado una nueva clave premium. Se ha activado el plan <b>{plan}</b> con <b>{maxi}</b> usos."
+            ),
+            parse_mode="HTML"
+        )
+        return
+
+
+@check_ban
+async def get_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Maneja el comando /get para obtener cuentas."""
+    if len(ctx.args) < 2:
+        await update.effective_chat.send_message(text="Uso: /get sitio cantidad")
+        return
+
+    sitio = ctx.args[0].strip().lower()
+    try:
+        cant = int(ctx.args[1])
+    except ValueError:
+        await update.effective_chat.send_message(text="Cantidad debe ser un número.")
+        return
+
+    uid = str(update.effective_user.id)
+    users = load_data(DB_USERS, {})
+    user_data = users.get(uid)
+
+    if not user_data or (user_data["plan_normal"]["nombre"] == "Sin plan" and user_data["plan_tarjetas"]["nombre"] == "Sin plan"):
+        await update.effective_chat.send_message(text="❌ Sin plan activo.")
+        return
+
+    if sitio == "turquia":
+        plan_tarjetas = user_data["plan_tarjetas"]
+        if plan_tarjetas["nombre"] == "Sin plan":
+            await update.effective_chat.send_message(
+                text="❌ Necesitas una clave de tarjetas para acceder a este stock."
+            )
+            return
+
+        cards = load_data(DB_CARDS, {})
+        tarjetas_disponibles = cards.get(sitio)
+        if not tarjetas_disponibles or len(tarjetas_disponibles) < cant:
+            await update.effective_chat.send_message(text=f"❌ Sin stock de tarjetas suficiente para {sitio}.")
+            return
+
+        disp = plan_tarjetas["max"] - plan_tarjetas["usados"]
+        if cant > disp:
+            await update.effective_chat.send_message(text=f"❌ Te quedan {disp} accesos para tarjetas.")
+            return
+
+        tarjetas = tarjetas_disponibles[:cant]
+        cards[sitio] = tarjetas_disponibles[cant:]
+        plan_tarjetas["usados"] += cant
+        save_data(DB_CARDS, cards)
+        save_data(DB_USERS, users)
+
+        texto = "\n".join([f"<code>{t}</code>" for t in tarjetas])
+        await update.effective_chat.send_message(
+            text=f"🎁 <b>{sitio}</b> ×{cant}\n\n{texto}\nUsos: {plan_tarjetas['usados']}/{plan_tarjetas['max']}",
+            parse_mode="HTML"
+        )
+        return
+
+    plan_normal = user_data["plan_normal"]
+    if plan_normal["nombre"] == "Sin plan":
+        await update.effective_chat.send_message(
+            text="❌ Necesitas una clave premium normal para acceder a este stock."
+        )
+        return
+
+    disp = plan_normal["max"] - plan_normal["usados"]
+    if cant > disp:
+        await update.effective_chat.send_message(text=f"❌ Te quedan {disp} accesos.")
+        return
+
+    stock = load_data(DB_STOCK, {})
+    cuentas_disponibles = stock.get(sitio)
+
+    if not cuentas_disponibles or len(cuentas_disponibles) < cant:
+        await update.effective_chat.send_message(text=f"❌ Sin stock suficiente para {sitio}.")
+        return
+
+    if isinstance(cuentas_disponibles[0], dict):
+        if cant > 1:
+            await update.effective_chat.send_message(text="❌ Este tipo de cuentas se envían de 1 en 1.")
+            return
+
+        cuenta = cuentas_disponibles.pop(0)
+        plan_normal["usados"] += 1
+        save_data(DB_STOCK, stock)
+        save_data(DB_USERS, users)
+
+        texto_pantalla = (
+            f"📺 <b>Pantalla</b>: <code>{cuenta.get('pantalla', 'N/A')}</code>\n"
+            f"⏳ <b>Mes</b>: <code>{cuenta.get('mes', 'N/A')}</code>\n"
+            f"📩 <b>Correo</b>: <code>{cuenta.get('correo', 'N/A')}</code>\n"
+            f"🔑 <b>Contraseña</b>: <code>{cuenta.get('contraseña', 'N/A')}</code>\n"
+            f"👤 <b>Perfil</b>: <code>{cuenta.get('perfil', 'N/A')}</code>\n"
+            f"🔐 <b>Pin</b>: <code>{cuenta.get('pin', 'N/A')}</code>\n"
+            f"🚫 <b>Fecha de corte</b>: <code>{cuenta.get('fecha_de_corte', 'N/A')}</code>\n\n"
+            f"Usos: {plan_normal['usados']}/{plan_normal['max']}"
+        )
+
+        try:
+            await ctx.bot.send_photo(
+                chat_id=update.effective_chat.id,
+                photo=cuenta.get("image_file_id"),
+                caption=texto_pantalla,
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            logging.error(f"Error al enviar la foto: {e}")
+            await update.effective_chat.send_message(text="❌ Error al enviar la cuenta de pantalla.")
+    else:
+        cuentas = cuentas_disponibles[:cant]
+        stock[sitio] = cuentas_disponibles[cant:]
+        plan_normal["usados"] += cant
+        save_data(DB_STOCK, stock)
+        save_data(DB_USERS, users)
+
+        texto = "\n".join([f"<code>{c}</code>" for c in cuentas])
+        await update.effective_chat.send_message(
+            text=f"🎁 <b>{sitio}</b> ×{cant}\n\n{texto}\nUsos: {plan_normal['usados']}/{plan_normal['max']}",
+            parse_mode="HTML"
+        )
+
+
+# --- Manejador genérico para mensajes no reconocidos ---
+async def handle_unknown_messages(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Responde a mensajes que no son comandos."""
+    await update.message.reply_text(
+        "❌ Lo siento, no entiendo ese comando. Usa <code>/start</code> para ver el menú principal.\n\n"
+        "<b>💳 Compra acceso premium aquí</b> 👉 @PAUBLITE_GT",
+        parse_mode="HTML"
+    )
+
+# --- Comandos de Admin ---
+@check_admin
+async def gen_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Maneja el comando /gen para generar claves de activación con un formato específico."""
+    claves = load_data(DB_KEYS, {})
+    planes = [
+        (1, "Bronce 1"),
+        (2, "Plata 2"),
+        (3, "Oro 3"),
+        (4, "Diamante 4")
+    ]
+    mensaje_salida = "✨ <b>Claves Premium Generadas:</b>\n\n"
+
+    for usos, nombre in planes:
+        codigo_unico = ''.join(random.choices(string.ascii_uppercase + string.digits, k=16))
+        key = f"paublte-gen{usos}-{codigo_unico}"
+
+        claves[key] = (nombre, usos)
+        mensaje_salida += f"• <code>{key}</code> → <b>{nombre}</b>\n"
+
+    save_data(DB_KEYS, claves)
+    await update.effective_chat.send_message(text=mensaje_salida, parse_mode="HTML")
+
+
+@check_admin
+async def super_pro_key_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Genera una clave 'SuperPro' con 1000 usos."""
+    claves = load_data(DB_KEYS, {})
+    codigo_unico = ''.join(random.choices(string.ascii_uppercase + string.digits, k=16))
+    key = f"paublte-superpro-{codigo_unico}"
+
+    plan_name = "SuperPro"
+    max_uses = 1000
+
+    claves[key] = (plan_name, max_uses)
+    save_data(DB_KEYS, claves)
+
+    await update.effective_chat.send_message(
+        text=f"✨ <b>Clave SuperPro Generada:</b>\n\n"
+             f"<code>{key}</code> → <b>{plan_name}</b>\n"
+             f"Accesos: <b>{max_uses}</b>",
+        parse_mode="HTML"
+    )
+
+@check_admin
+async def gen_cards_key_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Maneja el comando para generar una clave para el stock de tarjetas."""
+    card_keys = load_data(DB_CARD_KEYS, {})
+    codigo_unico = ''.join(random.choices(string.ascii_uppercase + string.digits, k=16))
+    key = f"paublte-tarjeta-{codigo_unico}"
+
+    plan_name = "Plan Tarjetas"
+    max_uses = 1
+
+    card_keys[key] = (plan_name, max_uses)
+    save_data(DB_CARD_KEYS, card_keys)
+
+    await update.effective_chat.send_message(
+        text=f"✨ <b>Clave para Tarjetas Generada:</b>\n\n"
+             f"<code>{key}</code> → <b>{plan_name}</b>\n"
+             f"Accesos: <b>{max_uses}</b>",
+        parse_mode="HTML"
+    )
+
+@check_admin
+async def users_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Muestra la lista de usuarios y sus planes."""
+    users = load_data(DB_USERS, {})
+    banned_users = load_data(DB_BANS, default=[])
+    lines = []
+
+    await update.effective_chat.send_message("🔍 <b>Obteniendo información de usuarios...</b>", parse_mode="HTML")
+
+    for uid, data in users.items():
+        try:
+            user_info = await ctx.bot.get_chat(int(uid))
+            username = f"@{user_info.username}" if user_info.username else "N/A"
+            full_name = user_info.full_name
+            status = "baneado 🚫" if int(uid) in banned_users else "activo ✅"
+
+            plan_normal_info = "Sin plan (0/0)"
+            plan_tarjetas_info = "Sin plan (0/0)"
+
+            if 'plan_normal' in data:
+                 plan_normal_info = f"{data['plan_normal']['nombre']} ({data['plan_normal']['usados']}/{data['plan_normal']['max']})"
+            elif 'plan' in data:
+                 plan_normal_info = f"{data['plan']} ({data['usados']}/{data['max']})"
+
+            if 'plan_tarjetas' in data:
+                 plan_tarjetas_info = f"{data['plan_tarjetas']['nombre']} ({data['plan_tarjetas']['usados']}/{data['plan_tarjetas']['max']})"
+
+            lines.append(
+                f"• ID: <code>{uid}</code>\n"
+                f"  Nombre: <code>{full_name}</code>\n"
+                f"  Username: <code>{username}</code>\n"
+                f"  Plan Normal: {plan_normal_info}\n"
+                f"  Plan Tarjetas: {plan_tarjetas_info}\n"
+                f"  Estado: {status}"
+            )
+        except error.TelegramError as e:
+            logging.warning(f"No se pudo obtener la información para el usuario con ID {uid}: {e}")
+            lines.append(f"• ID: <code>{uid}</code>\n"
+                         f"  Nombre: <code>(No disponible)</code>\n"
+                         f"  Plan Normal: {plan_normal_info}\n"
+                         f"  Plan Tarjetas: {plan_tarjetas_info}\n"
+                         f"  Estado: {status}")
+        except Exception as e:
+            logging.error(f"Error inesperado al procesar usuario {uid}: {e}")
+            lines.append(f"• ID: <code>{uid}</code>\n"
+                         f"  Nombre: <code>(Error)</code>\n"
+                         f"  Plan Normal: {plan_normal_info}\n"
+                         f"  Plan Tarjetas: {plan_tarjetas_info}\n"
+                         f"  Estado: {status}")
+
+    chunk_size = 10
+    chunks = [lines[i:i + chunk_size] for i in range(0, len(lines), chunk_size)]
+
+    if not chunks:
+        await update.effective_chat.send_message(
+            text="📭 No hay usuarios registrados.",
+            parse_mode="HTML"
+        )
+        return
+
+    await update.effective_chat.send_message("👥 <b>Usuarios Registrados:</b>\n\n", parse_mode="HTML")
+    for chunk in chunks:
+        await update.effective_chat.send_message(
+            text="\n\n".join(chunk),
+            parse_mode="HTML"
+        )
+
+
+# --- Funciones de Anuncio ---
+@check_admin
+async def start_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Inicia el flujo de conversación para enviar un mensaje a todos los usuarios."""
+    await update.effective_chat.send_message(
+        "Por favor, envía el mensaje que quieres enviar a todos los usuarios (texto, imagen o video)."
+    )
+    return BROADCAST_CONTENT
+
+async def receive_broadcast_content(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Recibe el contenido y lo envía a todos los usuarios."""
+    users = load_data(DB_USERS, {})
+    total_users = len(users)
+    total_sent = 0
+    total_failed = 0
+
+    await update.message.reply_text(f"🚀 <b>Iniciando envío a {total_users} usuarios...</b>", parse_mode="HTML")
+
+    msg_type = 'text'
+    msg_content = ""
+    msg_caption = ""
+
+    if update.message.text:
+        msg_content = update.message.text
+    elif update.message.photo:
+        msg_type = 'photo'
+        msg_content = update.message.photo[-1].file_id
+        msg_caption = update.message.caption or ""
+    elif update.message.video:
+        msg_type = 'video'
+        msg_content = update.message.video.file_id
+        msg_caption = update.message.caption or ""
+    else:
+        await update.message.reply_text("❌ Formato no soportado. Por favor, envía texto, una imagen o un video.")
+        return BROADCAST_CONTENT
+
+    for uid in users.keys():
+        try:
+            if msg_type == 'text':
+                await ctx.bot.send_message(chat_id=int(uid), text=msg_content, parse_mode="HTML")
+            elif msg_type == 'photo':
+                await ctx.bot.send_photo(chat_id=int(uid), photo=msg_content, caption=msg_caption, parse_mode="HTML")
+            elif msg_type == 'video':
+                await ctx.bot.send_video(chat_id=int(uid), video=msg_content, caption=msg_caption, parse_mode="HTML")
+            total_sent += 1
+        except Exception as e:
+            total_failed += 1
+            logging.error(f"Error al enviar mensaje a {uid}: {e}")
+
+    await update.message.reply_text(
+        f"✅ <b>Envío completado.</b>\n"
+        f"Mensajes enviados: {total_sent}\n"
+        f"Mensajes fallidos: {total_failed}",
+        parse_mode="HTML"
+    )
+
+    return ConversationHandler.END
+
+async def cancel_conv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Operación cancelada.")
+    return ConversationHandler.END
+
+
+# --- Lógica de Administración (Subir stock, ban, etc.) ---
+@check_admin
+async def ban_user_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Maneja el comando /ban."""
+    if not ctx.args:
+        await update.effective_chat.send_message(text="❌ Uso: /ban <code>&lt;user_id&gt;</code>", parse_mode="HTML")
+        return
+    try:
+        user_id_to_ban = int(ctx.args[0])
+    except (ValueError, IndexError):
+        await update.effective_chat.send_message(text="❌ El ID del usuario debe ser un número.")
+        return
+    banned_users = load_data(DB_BANS, default=[])
+    if user_id_to_ban in banned_users:
+        await update.effective_chat.send_message(text="❌ Este usuario ya está baneado.")
+        return
+    banned_users.append(user_id_to_ban)
+    save_data(DB_BANS, banned_users)
+    await update.effective_chat.send_message(text=f"✅ Usuario con ID <code>{user_id_to_ban}</code> baneado con éxito.", parse_mode="HTML")
+
+@check_admin
+async def unban_user_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Maneja el comando /unban."""
+    if not ctx.args:
+        await update.effective_chat.send_message(text="❌ Uso: /unban <code>&lt;user_id&gt;</code>", parse_mode="HTML")
+        return
+    try:
+        user_id_to_unban = int(ctx.args[0])
+    except (ValueError, IndexError):
+        await update.effective_chat.send_message(text="❌ El ID del usuario debe ser un número.")
+        return
+    banned_users = load_data(DB_BANS, default=[])
+    if user_id_to_unban not in banned_users:
+        await update.effective_chat.send_message(text="❌ Este usuario no está baneado.")
+        return
+    banned_users.remove(user_id_to_unban)
+    save_data(DB_BANS, banned_users)
+
+    # Reiniciar intentos de clave al desbanear
+    users = load_data(DB_USERS, {})
+    user_id_str = str(user_id_to_unban)
+    if user_id_str in users:
+        users[user_id_str]['invalid_key_attempts'] = 0
+        save_data(DB_USERS, users)
+
+    await update.effective_chat.send_message(text=f"✅ Usuario con ID <code>{user_id_to_unban}</code> desbaneado con éxito. Sus intentos de clave han sido reiniciados.", parse_mode="HTML")
+
+
+@check_admin
+async def addstock_start_conv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.effective_chat.send_message("<b>Uso:</b>\n<code>sitio,cuenta1,cuenta2,...</code>\n\n<b>Ejemplo:</b>\n<code>netflix,mail@mail.com:pass,mail2@mail.com:pass2</code>", parse_mode="HTML")
+    return AWAITING_STOCK_DATA
+
+@check_admin
+async def receive_stock_data(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    try:
+        data = update.message.text.split(',')
+        if len(data) < 2:
+            await update.effective_chat.send_message("❌ Formato incorrecto. Inténtalo de nuevo.")
+            return AWAITING_STOCK_DATA
+        sitio = data[0].strip().lower()
+        cuentas_a_agregar = [c.strip() for c in data[1:]]
+        stock = load_data(DB_STOCK, {})
+        if sitio not in stock:
+            stock[sitio] = []
+        stock[sitio].extend(cuentas_a_agregar)
+        save_data(DB_STOCK, stock)
+        await update.effective_chat.send_message(f"✅ Se han agregado <b>{len(cuentas_a_agregar)}</b> cuentas al stock de <code>{sitio}</code>.", parse_mode="HTML")
+    except Exception as e:
+        await update.effective_chat.send_message(f"❌ Ocurrió un error: {e}")
+    return ConversationHandler.END
+
+
+@check_admin
+async def addcards_start_conv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.effective_chat.send_message("<b>Uso:</b>\n<code>banco,tarjeta1,tarjeta2,...</code>\n\n<b>Ejemplo:</b>\n<code>turquia,456789...:01/25:123,456790...:02/26:456</code>", parse_mode="HTML")
+    return AWAITING_CARDS_DATA
+
+@check_admin
+async def receive_cards_data(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    try:
+        data = update.message.text.split(',')
+        if len(data) < 2:
+            await update.effective_chat.send_message("❌ Formato incorrecto. Inténtalo de nuevo.")
+            return AWAITING_CARDS_DATA
+        banco = data[0].strip().lower()
+        tarjetas_a_agregar = [t.strip() for t in data[1:]]
+        cards = load_data(DB_CARDS, {})
+        if banco not in cards:
+            cards[banco] = []
+        cards[banco].extend(tarjetas_a_agregar)
+        save_data(DB_CARDS, cards)
+        await update.effective_chat.send_message(f"✅ Se han agregado <b>{len(tarjetas_a_agregar)}</b> tarjetas al stock de <code>{banco}</code>.", parse_mode="HTML")
+    except Exception as e:
+        await update.effective_chat.send_message(f"❌ Ocurrió un error: {e}")
+    return ConversationHandler.END
+
+
+@check_admin
+async def revoke_premium_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.effective_chat.send_message("Por favor, envía el ID del usuario al que deseas quitar el plan premium.")
+    return AWAITING_USER_ID_TO_REVOKE
+
+async def revoke_premium(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    try:
+        user_id = int(update.message.text.strip())
+        users = load_data(DB_USERS, {})
+        uid_str = str(user_id)
+        if uid_str in users:
+            users[uid_str]["plan_normal"] = {"nombre": "Sin plan", "max": 0, "usados": 0}
+            users[uid_str]["plan_tarjetas"] = {"nombre": "Sin plan", "max": 0, "usados": 0}
+            save_data(DB_USERS, users)
+            await update.message.reply_text(f"✅ Se ha quitado el plan premium al usuario con ID <code>{user_id}</code>.", parse_mode="HTML")
+        else:
+            await update.message.reply_text("❌ No se encontró al usuario con ese ID.")
+    except ValueError:
+        await update.message.reply_text("❌ ID de usuario inválido. Por favor, envía un número.")
+    return ConversationHandler.END
+
+
+# --- Funciones para los Callbacks de los botones Inline ---
+async def handle_callback_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "start_menu":
+        await query.edit_message_text(
+            text=get_start_text(update.effective_user),
+            parse_mode="HTML",
+            reply_markup=kb_start(update.effective_user.id)
+        )
+    elif query.data == "profile":
+        await profile_cmd(update, ctx)
+    elif query.data == "stock":
+        await stock_cmd(update, ctx)
+    elif query.data == "cmds":
+        await cmds_cmd(update, ctx)
+    elif query.data == "panel":
+        await panel_cmd(update, ctx)
+    elif query.data == "gen_cmd":
+        await gen_cmd(update, ctx)
+    elif query.data == "super_pro_key":
+        await super_pro_key_cmd(update, ctx)
+    elif query.data == "revoke_premium_start":
+        await revoke_premium_start(update, ctx)
+    elif query.data == "users_cmd":
+        await users_cmd(update, ctx)
+    elif query.data == "ban_cmd":
+        await query.message.reply_text("❌ Uso: /ban <code>&lt;user_id&gt;</code>", parse_mode="HTML")
+    elif query.data == "unban_cmd":
+        await query.message.reply_text("❌ Uso: /unban <code>&lt;user_id&gt;</code>", parse_mode="HTML")
+    elif query.data == "addstock_start":
+        await addstock_start_conv(update, ctx)
+    elif query.data == "addcards_start":
+        await addcards_start_conv(update, ctx)
+    elif query.data == "gen_cards_key":
+        await gen_cards_key_cmd(update, ctx)
+    elif query.data == "send_msg_cmd":
+        await start_broadcast(update, ctx)
+    elif query.data == "add_admin_start":
+        await add_admin_start(update, ctx)
+    elif query.data == "rem_admin_start":
+        await rem_admin_start(update, ctx)
+
+def get_start_text(user_info):
+    return (
+        f"<u><b>🎉 Bienvenido a PAUBLITE_GT</b></u>\n\n"
+        f"<b>🆔 Tu ID:</b> <code>{user_info.id}</code>\n"
+        f"<b>👤 Tu Nombre:</b> <code>{user_info.first_name}</code>\n"
+        f"<b>🔗 Tu Username:</b> @{user_info.username or 'N/A'}\n\n"
+        f"<b>💳 Compra claves premium aquí 👉 @PAUBLITE_GT</b>\n"
+        f"<b>🔗 Canal Oficial:</b> https://t.me/+kpO7XeoQsDQ0MWM0\n\n"
+        f"<b>📌 Comandos:</b>\n"
+        f"  - <code>/key CLAVE</code>\n"
+        f"  - <code>/get sitio cant</code>\n\n"
+        f"<b>📌 Administración:</b> Panel abajo"
+    )
+
+# --- Comandos de Botones ---
+@check_ban
+async def profile_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_user.id)
+    users = load_data(DB_USERS, {})
+    user_data = users.get(uid)
+    
+    # Obtener la información completa del usuario para su nombre de usuario
+    user_info = update.effective_user
+    username = f"@{user_info.username}" if user_info.username else "N/A"
+    
+    # Determinar el rango del usuario
+    user_rank = "Usuario"
+    if int(uid) == ADMIN:
+        user_rank = "Creador 👑"
+    elif is_admin(int(uid)):
+        user_rank = "Admin ✨"
+
+    if not user_data:
+        await update.effective_chat.send_message(
+            "❌ No se encontró tu perfil. Por favor, usa /start de nuevo."
+        )
+        return
+
+    profile_text = (
+        f"<b>👤 Perfil</b>\n"
+        f"<b>🆔 ID:</b> <code>{update.effective_user.id}</code>\n"
+        f"<b>🔗 Usuario:</b> {username}\n"
+        f"<b>🎖️ Rango:</b> {user_rank}\n"
+        f"<b>✨ Plan Cuentas:</b> {user_data['plan_normal']['nombre']} ({user_data['plan_normal']['usados']}/{user_data['plan_normal']['max']})\n"
+        f"<b>💳 Plan Tarjetas:</b> {user_data['plan_tarjetas']['nombre']} ({user_data['plan_tarjetas']['usados']}/{user_data['plan_tarjetas']['max']})\n\n"
+        f"<b>¿No tienes un plan?</b>\n"
+        f"Usa <code>/key CLAVE</code> para activarlo.\n"
+        f"<b>Compra claves premium aquí 👉 @PAUBLITE_GT</b>"
+    )
+
+    await update.effective_chat.send_message(
+        text=profile_text,
+        parse_mode="HTML",
+        reply_markup=KB_RETURN_TO_START
+    )
+
+@check_ban
+async def stock_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    stock = load_data(DB_STOCK, {})
+    cards = load_data(DB_CARDS, {})
+    stock_text = "📦 <b>Stock Disponible:</b>\n\n"
+    if stock:
+        for sitio, cuentas in stock.items():
+            stock_text += f"• <b><code>{sitio.capitalize()}</code>:</b> <code>{len(cuentas)}</code> cuentas\n"
+    else:
+        stock_text += "• No hay stock de cuentas disponible.\n"
+    
+    stock_text += "\n<b>💳 Stock de Tarjetas:</b>\n"
+    if cards:
+        for banco, tarjetas in cards.items():
+            stock_text += f"• <b><code>{banco.capitalize()}</code>:</b> <code>{len(tarjetas)}</code> tarjetas\n"
+    else:
+        stock_text += "• No hay stock de tarjetas disponible.\n"
+    
+    await update.effective_chat.send_message(
+        text=stock_text,
+        parse_mode="HTML",
+        reply_markup=KB_RETURN_TO_START
+    )
+
+@check_ban
+async def cmds_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    cmds_text = (
+        "<b>📖 Comandos Disponibles:</b>\n\n"
+        "• <code>/start</code> - Inicia el bot y muestra el menú.\n"
+        "• <code>/key CLAVE</code> - Activa una clave premium.\n"
+        "• <code>/get sitio cantidad</code> - Obtiene cuentas de un sitio específico.\n"
+    )
+    await update.effective_chat.send_message(
+        text=cmds_text,
+        parse_mode="HTML",
+        reply_markup=KB_RETURN_TO_START
+    )
+
+@check_admin
+async def panel_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.effective_chat.send_message(
+        text="⚙️ <b>Panel de Administración</b>",
+        parse_mode="HTML",
+        reply_markup=KB_ADMIN
+    )
+
+
+# --- Comandos para Admins adicionales (añadir/quitar) ---
+@check_super_admin
+async def add_admin_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.effective_chat.send_message("Por favor, envía el ID del usuario que deseas promover a admin.")
+    return AWAITING_ADMIN_ID
+
+@check_super_admin
+async def add_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    try:
+        new_admin_id = int(update.message.text.strip())
+        if new_admin_id == ADMIN:
+            await update.message.reply_text("❌ Este usuario ya es el super admin.")
+            return ConversationHandler.END
+
+        admins = load_data(DB_ADMINS, default=[])
+        if new_admin_id in admins:
+            await update.message.reply_text("❌ Este usuario ya es un administrador.")
+            return ConversationHandler.END
+
+        admins.append(new_admin_id)
+        save_data(DB_ADMINS, admins)
+        await update.message.reply_text(f"✅ Usuario con ID <code>{new_admin_id}</code> ha sido promovido a administrador.", parse_mode="HTML")
+        return ConversationHandler.END
+    except ValueError:
+        await update.message.reply_text("❌ ID de usuario inválido. Por favor, envía un número.")
+        return AWAITING_ADMIN_ID
+
+
+@check_super_admin
+async def rem_admin_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.effective_chat.send_message("Por favor, envía el ID del usuario que deseas degradar de admin.")
+    return AWAITING_REMOVE_ADMIN_ID
+
+@check_super_admin
+async def rem_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    try:
+        admin_id_to_remove = int(update.message.text.strip())
+        if admin_id_to_remove == ADMIN:
+            await update.message.reply_text("❌ No puedes degradar al super admin.")
+            return ConversationHandler.END
+
+        admins = load_data(DB_ADMINS, default=[])
+        if admin_id_to_remove not in admins:
+            await update.message.reply_text("❌ Este usuario no es un administrador.")
+            return ConversationHandler.END
+
+        admins.remove(admin_id_to_remove)
+        save_data(DB_ADMINS, admins)
+        await update.message.reply_text(f"✅ Usuario con ID <code>{admin_id_to_remove}</code> ha sido degradado.", parse_mode="HTML")
+        return ConversationHandler.END
+    except ValueError:
+        await update.message.reply_text("❌ ID de usuario inválido. Por favor, envía un número.")
+        return AWAITING_REMOVE_ADMIN_ID
+
+
+def main():
+    """Ejecuta el bot."""
+    logging.info("🚀 Iniciando el bot...")
+    application = Application.builder().token(TOKEN).build()
+
+    # Handlers para comandos
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("key", key_cmd))
+    application.add_handler(CommandHandler("get", get_cmd))
+    application.add_handler(CommandHandler("gen", gen_cmd))
+    application.add_handler(CommandHandler("users", users_cmd))
+    application.add_handler(CommandHandler("ban", ban_user_cmd))
+    application.add_handler(CommandHandler("unban", unban_user_cmd))
+    application.add_handler(CommandHandler("superpro", super_pro_key_cmd))
+
+    # Handlers para Callbacks de botones
+    application.add_handler(CallbackQueryHandler(handle_callback_query))
+
+    # Handlers para conversación de admins
+    conv_handler_add_stock = ConversationHandler(
+        entry_points=[CallbackQueryHandler(addstock_start_conv, pattern="^addstock_start$")],
+        states={
+            AWAITING_STOCK_DATA: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_stock_data)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_conv)],
+    )
+
+    conv_handler_add_cards = ConversationHandler(
+        entry_points=[CallbackQueryHandler(addcards_start_conv, pattern="^addcards_start$")],
+        states={
+            AWAITING_CARDS_DATA: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_cards_data)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_conv)],
+    )
+
+    conv_handler_revoke_premium = ConversationHandler(
+        entry_points=[CallbackQueryHandler(revoke_premium_start, pattern="^revoke_premium_start$")],
+        states={
+            AWAITING_USER_ID_TO_REVOKE: [MessageHandler(filters.TEXT & ~filters.COMMAND, revoke_premium)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_conv)],
+    )
+
+    conv_handler_broadcast = ConversationHandler(
+        entry_points=[CallbackQueryHandler(start_broadcast, pattern="^send_msg_cmd$")],
+        states={
+            BROADCAST_CONTENT: [MessageHandler(filters.ALL & ~filters.COMMAND, receive_broadcast_content)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_conv)],
+    )
+
+    conv_handler_add_admin = ConversationHandler(
+        entry_points=[CallbackQueryHandler(add_admin_start, pattern="^add_admin_start$")],
+        states={
+            AWAITING_ADMIN_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_admin)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_conv)],
+    )
+
+    conv_handler_rem_admin = ConversationHandler(
+        entry_points=[CallbackQueryHandler(rem_admin_start, pattern="^rem_admin_start$")],
+        states={
+            AWAITING_REMOVE_ADMIN_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, rem_admin)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_conv)],
+    )
+
+    application.add_handler(conv_handler_add_stock)
+    application.add_handler(conv_handler_add_cards)
+    application.add_handler(conv_handler_revoke_premium)
+    application.add_handler(conv_handler_broadcast)
+    application.add_handler(conv_handler_add_admin)
+    application.add_handler(conv_handler_rem_admin)
+
+    # Handler para mensajes no reconocidos
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_unknown_messages))
+
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == "__main__":
+    main()
